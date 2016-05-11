@@ -1,0 +1,276 @@
+#
+# Fluentd Kubernetes Metadata Filter Plugin - Enrich Fluentd events with
+# Kubernetes metadata
+#
+# Copyright 2015 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+require 'fluent/input'
+
+
+module Fluent
+  class KubernetesMetadataInput < Fluent::Input
+    K8_POD_CA_CERT = 'ca.crt'
+    K8_POD_TOKEN = 'token'
+
+    Fluent::Plugin.register_input('kubernetes_metadata', self)
+
+    config_param :kubernetes_url, :string, default: nil
+    config_param :cache_size, :integer, default: 1000
+    config_param :cache_ttl, :integer, default: 60 * 60
+    config_param :watch, :bool, default: true
+    config_param :apiVersion, :string, default: 'v1'
+    config_param :client_cert, :string, default: nil
+    config_param :client_key, :string, default: nil
+    config_param :ca_file, :string, default: nil
+    config_param :verify_ssl, :bool, default: true
+    config_param :tag_to_kubernetes_name_regexp,
+                 :string,
+                 :default => 'var\.log\.containers\.(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace>[^_]+)_(?<container_name>.+)-(?<docker_id>[a-z0-9]{64})\.log$'
+    config_param :bearer_token_file, :string, default: nil
+    config_param :merge_json_log, :bool, default: true
+    config_param :preserve_json_log, :bool, default: true
+    config_param :include_namespace_id, :bool, default: false
+    config_param :secret_dir, :string, default: '/var/run/secrets/kubernetes.io/serviceaccount'
+    config_param :de_dot, :bool, default: true
+    config_param :de_dot_separator, :string, default: '_'
+
+    def syms_to_strs(hsh)
+      newhsh = {}
+      hsh.each_pair do |kk,vv|
+        if vv.is_a?(Hash)
+          vv = syms_to_strs(vv)
+        end
+        if kk.is_a?(Symbol)
+          newhsh[kk.to_s] = vv
+        else
+          newhsh[kk] = vv
+        end
+      end
+      newhsh
+    end
+
+    def get_immutable_metadata(pod_name, namespace_name)
+      begin
+        metadata = @client.get_pod(pod_name, namespace_name)
+        return if !metadata
+        pod_immutable = {
+          'name' => metadata['metadata']['name'],
+          'namespace_name'=> metadata['metadata']['namespace'],
+          'id' => metadata['metadata']['uid'],
+          'creationTimestamp' => metadata['metadata']['creationTimestamp']
+        }
+        return pod_immutable
+      rescue KubeException => e
+        raise Fluent::ConfigError, "Exception encountered fetching Kubernetes pod immutable metadata: #{e.message}"
+      end
+    end
+
+    def get_metadata(pod_name, namespace_name)
+      begin
+        metadata = @client.get_pod(pod_name, namespace_name)
+        return if !metadata
+        labels = syms_to_strs(metadata['metadata']['labels'].to_h)
+        annotations = syms_to_strs(metadata['metadata']['annotations'].to_h)
+        spec = syms_to_strs(metadata['spec'].to_h)
+        mtd = syms_to_strs(metadata['metadata'].to_h)
+        status = syms_to_strs(metadata['status'].to_h)
+        pod = {
+          'name' => metadata['metadata']['name'],
+          'namespace'=> metadata['metadata']['namespace'],
+          'id' => metadata['metadata']['uid'],
+          'labels' => labels,
+          'annotations' => annotations,
+          'creationTimestamp' => metadata['metadata']['creationTimestamp']
+        }
+        return {
+            'pod'       => pod,
+            'spec'           => spec, #metadata['spec'],
+            'status'         => status,
+            'metadata'           => mtd
+        }
+      rescue KubeException => e
+        raise Fluent::ConfigError, "Exception encountered fetching Kubernetes pod metadata: #{e.message}"
+      end
+    end
+
+    def initialize
+      super
+      require 'kubeclient'
+      require 'active_support/core_ext/object/blank'
+      require 'lru_redux'
+    end
+
+    def configure(conf)
+      super
+
+
+      if @de_dot && (@de_dot_separator =~ /\./).present?
+        raise Fluent::ConfigError, "Invalid de_dot_separator: cannot be or contain '.'"
+      end
+
+#      if @cache_ttl < 0
+#        @cache_ttl = :none
+#      end
+#      @cache = LruRedux::TTL::ThreadSafeCache.new(@cache_size, @cache_ttl)
+      @tag_to_kubernetes_name_regexp_compiled = Regexp.compile(@tag_to_kubernetes_name_regexp)
+
+      # Use Kubernetes default service account if we're in a pod.
+      if @kubernetes_url.nil?
+        env_host = ENV['KUBERNETES_SERVICE_HOST']
+        env_port = ENV['KUBERNETES_SERVICE_PORT']
+        if env_host.present? && env_port.present?
+          @kubernetes_url = "https://#{env_host}:#{env_port}/api"
+        end
+      end
+      unless @kubernetes_url
+        raise Fluent::ConfigError, "kubernetes_url is not defined"
+      end
+
+      # Use SSL certificate and bearer token from Kubernetes service account.
+      if Dir.exist?(@secret_dir)
+        ca_cert = File.join(@secret_dir, K8_POD_CA_CERT)
+        pod_token = File.join(@secret_dir, K8_POD_TOKEN)
+
+        if !@ca_file.present? and File.exist?(ca_cert)
+          @ca_file = ca_cert
+        end
+
+        if !@bearer_token_file.present? and File.exist?(pod_token)
+          @bearer_token_file = pod_token
+        end
+      end
+    end
+
+    def start
+
+      start_kubclient
+
+      if @watch
+        @thread = Thread.new(&method(:watch_pods))
+        @thread.abort_on_exception = true
+      end
+    end
+
+    def start_kubclient
+      return @client if @client
+
+      if @kubernetes_url.present?
+
+        ssl_options = {
+            client_cert: @client_cert.present? ? OpenSSL::X509::Certificate.new(File.read(@client_cert)) : nil,
+            client_key:  @client_key.present? ? OpenSSL::PKey::RSA.new(File.read(@client_key)) : nil,
+            ca_file:     @ca_file,
+            verify_ssl:  @verify_ssl ? OpenSSL::SSL::VERIFY_PEER : OpenSSL::SSL::VERIFY_NONE
+        }
+
+        auth_options = {}
+
+        if @bearer_token_file.present?
+          bearer_token = File.read(@bearer_token_file)
+          auth_options[:bearer_token] = bearer_token
+        end
+
+        @client = Kubeclient::Client.new @kubernetes_url, @apiVersion,
+                                         ssl_options: ssl_options,
+                                         auth_options: auth_options
+
+        begin
+          @client.api_valid?
+        rescue KubeException => kube_error
+          raise Fluent::ConfigError, "Invalid Kubernetes API #{@apiVersion} endpoint #{@kubernetes_url}: #{kube_error.message}"
+        end
+      end
+    end
+
+    def shutdown
+      @thread.exit
+    end
+
+
+
+    def merge_json_log(record)
+      if record.has_key?('log')
+        log = record['log'].strip
+        if log[0].eql?('{') && log[-1].eql?('}')
+          begin
+            record = JSON.parse(log).merge(record)
+            unless @preserve_json_log
+              record.delete('log')
+            end
+          rescue JSON::ParserError
+          end
+        end
+      end
+      record
+    end
+
+    def de_dot!(h)
+      h.keys.each do |ref|
+        if h[ref] && ref =~ /\./
+          v = h.delete(ref)
+          newref = ref.to_s.gsub('.', @de_dot_separator)
+          h[newref] = v
+        end
+      end
+    end
+
+    def watch_pods
+      begin
+        resource_version = @client.get_pods.resourceVersion
+        watcher          = @client.watch_pods(resource_version)
+      rescue Exception => e
+        raise Fluent::ConfigError, "Exception encountered fetching metadata from Kubernetes API endpoint: #{e.message}"
+      end
+
+      time = Engine.now
+
+      watcher.each do |notice|
+        case notice.type
+          when 'ADDED'
+            emit_pod_added(notice.object['metadata']['name'],notice.object['metadata']['namespace'], time)
+            emit_pod_config_update(notice.object,time)
+          when 'MODIFIED'
+            emit_pod_config_update(notice.object,time)
+          else
+            emit_pod_config_update(notice.object,time)
+            # Don't pay attention to creations, since the created pod may not
+            # end up on this node.
+        end
+      end
+    end
+
+    def emit_pod_added(pod_name, namespace_name, time)
+      payload = get_immutable_metadata(pod_name, namespace_name)
+      tag = "kubernetes.pod.#{namespace_name}.#{pod_name}"
+      router.emit(tag, time, payload)
+    end
+
+    def emit_pod_config_update(notice_obj, time)
+      namespace_name = notice_obj['metadata']['namespace']
+      tag = "kubernetes.pod_update.#{notice_obj['metadata']['namespace']}.#{notice_obj['metadata']['name']}"
+      payload = {
+        'status' => notice_obj['status']['phase'],
+        'pod_ip' => notice_obj['status']['podIP'],
+        'host_ip' => notice_obj['status']['hostIP'],
+        'hostname' => notice_obj['spec']['host'],
+        'containers' => notice_obj['status']['containerStatuses']
+      }
+      payload['labels'] = syms_to_strs(notice_obj['metadata']['labels'].to_h) if notice_obj['metadata']['labels']
+      payload['annotations'] = syms_to_strs(notice_obj['metadata']['annotations'].to_h) if notice_obj['metadata']['annotations']
+      router.emit(tag, time, payload)
+    end
+
+  end
+end
