@@ -45,6 +45,7 @@ module Fluent
     config_param :secret_dir, :string, default: '/var/run/secrets/kubernetes.io/serviceaccount'
     config_param :de_dot, :bool, default: true
     config_param :de_dot_separator, :string, default: '_'
+    config_param :refresh_pods_on_start, :bool, default: false
 
     def syms_to_strs(hsh)
       newhsh = {}
@@ -77,39 +78,10 @@ module Fluent
       end
     end
 
-    def get_metadata(pod_name, namespace_name)
-      begin
-        metadata = @client.get_pod(pod_name, namespace_name)
-        return if !metadata
-        labels = syms_to_strs(metadata['metadata']['labels'].to_h)
-        annotations = syms_to_strs(metadata['metadata']['annotations'].to_h)
-        spec = syms_to_strs(metadata['spec'].to_h)
-        mtd = syms_to_strs(metadata['metadata'].to_h)
-        status = syms_to_strs(metadata['status'].to_h)
-        pod = {
-          'name' => metadata['metadata']['name'],
-          'namespace'=> metadata['metadata']['namespace'],
-          'id' => metadata['metadata']['uid'],
-          'labels' => labels,
-          'annotations' => annotations,
-          'creationTimestamp' => metadata['metadata']['creationTimestamp']
-        }
-        return {
-            'pod'       => pod,
-            'spec'           => spec, #metadata['spec'],
-            'status'         => status,
-            'metadata'           => mtd
-        }
-      rescue KubeException => e
-        raise Fluent::ConfigError, "Exception encountered fetching Kubernetes pod metadata: #{e.message}"
-      end
-    end
-
     def initialize
       super
       require 'kubeclient'
       require 'active_support/core_ext/object/blank'
-      require 'lru_redux'
     end
 
     def configure(conf)
@@ -120,10 +92,6 @@ module Fluent
         raise Fluent::ConfigError, "Invalid de_dot_separator: cannot be or contain '.'"
       end
 
-#      if @cache_ttl < 0
-#        @cache_ttl = :none
-#      end
-#      @cache = LruRedux::TTL::ThreadSafeCache.new(@cache_size, @cache_ttl)
       @tag_to_kubernetes_name_regexp_compiled = Regexp.compile(@tag_to_kubernetes_name_regexp)
 
       # Use Kubernetes default service account if we're in a pod.
@@ -156,6 +124,11 @@ module Fluent
     def start
 
       start_kubclient
+
+      if @refresh_pods_on_start
+        pod_refresh = Thread.new(&method(:refresh_pods))
+        pod_refresh.join
+      end
 
       if @watch
         @thread = Thread.new(&method(:watch_pods))
@@ -261,15 +234,23 @@ module Fluent
       namespace_name = notice_obj['metadata']['namespace']
       tag = "kubernetes.pod_update.#{notice_obj['metadata']['namespace']}.#{notice_obj['metadata']['name']}"
       payload = {
+        'name' => notice_obj['metadata']['name'],
+        'namespace_name' => notice_obj['metadata']['namespace'],
         'status' => notice_obj['status']['phase'],
-        'pod_ip' => notice_obj['status']['podIP'],
-        'host_ip' => notice_obj['status']['hostIP'],
-        'hostname' => notice_obj['spec']['host'],
         'containers' => notice_obj['status']['containerStatuses']
       }
       payload['labels'] = syms_to_strs(notice_obj['metadata']['labels'].to_h) if notice_obj['metadata']['labels']
       payload['annotations'] = syms_to_strs(notice_obj['metadata']['annotations'].to_h) if notice_obj['metadata']['annotations']
+      payload['pod_ip'] notice_obj['status']['podIP'] if notice_obj['status']['podIP']
+      payload['host_ip'] notice_obj['status']['hostIP'] if notice_obj['status']['hostIP']
+      payload['hostname'] notice_obj['status']['host'] if notice_obj['status']['host']
+      payload['containers'] notice_obj['status']['containerStatuses'] if notice_obj['status']['containerStatuses']
+
       router.emit(tag, time, payload)
+    end
+
+    def refresh_pods
+      @client.get_pods
     end
 
   end
