@@ -241,10 +241,10 @@ module Fluent
       }
       payload['labels'] = syms_to_strs(notice_obj['metadata']['labels'].to_h) if notice_obj['metadata']['labels']
       payload['annotations'] = syms_to_strs(notice_obj['metadata']['annotations'].to_h) if notice_obj['metadata']['annotations']
-      payload['pod_ip'] notice_obj['status']['podIP'] if notice_obj['status']['podIP']
-      payload['host_ip'] notice_obj['status']['hostIP'] if notice_obj['status']['hostIP']
-      payload['hostname'] notice_obj['status']['host'] if notice_obj['status']['host']
-      payload['containers'] notice_obj['status']['containerStatuses'] if notice_obj['status']['containerStatuses']
+      payload['pod_ip'] = notice_obj['status']['podIP'] if notice_obj['status']['podIP']
+      payload['host_ip'] = notice_obj['status']['hostIP'] if notice_obj['status']['hostIP']
+      payload['hostname'] = notice_obj['status']['host'] if notice_obj['status']['host']
+      payload['containers'] = notice_obj['status']['containerStatuses'] if notice_obj['status']['containerStatuses']
 
       router.emit(tag, time, payload)
     end
