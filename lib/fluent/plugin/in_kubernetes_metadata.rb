@@ -134,6 +134,9 @@ module Fluent
         @thread = Thread.new(&method(:watch_pods))
         @thread.abort_on_exception = true
       end
+
+      @thread_events = Thread.new(&method(:watch_events))
+      @thread_events.abort_on_exception = true
     end
 
     def start_kubclient
@@ -169,6 +172,7 @@ module Fluent
 
     def shutdown
       @thread.exit
+      @thread_events.exit
     end
 
 
@@ -224,6 +228,29 @@ module Fluent
       end
     end
 
+    def watch_events
+      begin
+        resource_version = @client.get_pods.resourceVersion
+        watcher          = @client.watch_events(resource_version)
+      rescue Exception => e
+        raise Fluent::ConfigError, "Exception encountered fetching metadata from Kubernetes API endpoint: #{e.message}"
+      end
+
+      time = Engine.now
+
+      watcher.each do |notice|
+        emit_event(notice.object, time, notice.type)
+      end
+    end
+
+    def emit_event(event_obj, time, type)
+      payload = syms_to_strs(event_obj)
+      payload['event_type'] = type
+      tag = "kubernetes.event.#{event_obj['metadata']['namespace']}.#{event_obj['metadata']['name']}"
+
+      router.emit(tag, time, payload)
+    end
+
     def emit_pod_added(pod_name, namespace_name, time)
       payload = get_immutable_metadata(pod_name, namespace_name)
       tag = "kubernetes.pod.#{namespace_name}.#{pod_name}"
@@ -239,8 +266,8 @@ module Fluent
         'status' => notice_obj['status']['phase'],
         'containers' => notice_obj['status']['containerStatuses']
       }
-      payload['labels'] = syms_to_strs(notice_obj['metadata']['labels'].to_h) if notice_obj['metadata']['labels']
-      payload['annotations'] = syms_to_strs(notice_obj['metadata']['annotations'].to_h) if notice_obj['metadata']['annotations']
+      payload['labels'] = syms_to_strs(notice_obj['metadata']['labels'].to_h).map{|k,v| "#{k}=#{v}"}.join('') if notice_obj['metadata']['labels']
+      payload['annotations'] = syms_to_strs(notice_obj['metadata']['annotations'].to_h).map{|k,v| "#{k}=#{v}"}.join('') if notice_obj['metadata']['annotations']
       payload['pod_ip'] = notice_obj['status']['podIP'] if notice_obj['status']['podIP']
       payload['host_ip'] = notice_obj['status']['hostIP'] if notice_obj['status']['hostIP']
       payload['hostname'] = notice_obj['status']['host'] if notice_obj['status']['host']
