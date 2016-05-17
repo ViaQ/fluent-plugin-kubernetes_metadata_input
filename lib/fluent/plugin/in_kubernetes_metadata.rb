@@ -211,9 +211,9 @@ module Fluent
         raise Fluent::ConfigError, "Exception encountered fetching metadata from Kubernetes API endpoint: #{e.message}"
       end
 
-      time = Engine.now
 
       watcher.each do |notice|
+        time = Engine.now
         case notice.type
           when 'ADDED'
             emit_pod_added(notice.object['metadata']['name'],notice.object['metadata']['namespace'], time)
@@ -236,9 +236,9 @@ module Fluent
         raise Fluent::ConfigError, "Exception encountered fetching metadata from Kubernetes API endpoint: #{e.message}"
       end
 
-      time = Engine.now
 
       watcher.each do |notice|
+        time = Engine.now
         emit_event(notice.object, time, notice.type)
       end
     end
