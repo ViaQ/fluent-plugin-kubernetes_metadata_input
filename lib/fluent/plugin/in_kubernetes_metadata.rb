@@ -27,17 +27,11 @@ module Fluent
     Fluent::Plugin.register_input('kubernetes_metadata', self)
 
     config_param :kubernetes_url, :string, default: nil
-    config_param :cache_size, :integer, default: 1000
-    config_param :cache_ttl, :integer, default: 60 * 60
-    config_param :watch, :bool, default: true
     config_param :apiVersion, :string, default: 'v1'
     config_param :client_cert, :string, default: nil
     config_param :client_key, :string, default: nil
     config_param :ca_file, :string, default: nil
     config_param :verify_ssl, :bool, default: true
-    config_param :tag_to_kubernetes_name_regexp,
-                 :string,
-                 :default => 'var\.log\.containers\.(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace>[^_]+)_(?<container_name>.+)-(?<docker_id>[a-z0-9]{64})\.log$'
     config_param :bearer_token_file, :string, default: nil
     config_param :merge_json_log, :bool, default: true
     config_param :preserve_json_log, :bool, default: true
@@ -45,7 +39,8 @@ module Fluent
     config_param :secret_dir, :string, default: '/var/run/secrets/kubernetes.io/serviceaccount'
     config_param :de_dot, :bool, default: true
     config_param :de_dot_separator, :string, default: '_'
-    config_param :refresh_pods_on_start, :bool, default: false
+    desc 'Kubernetes resource type to watch.'
+    config_param :resource, :string, default: "Events"
 
     def syms_to_strs(hsh)
       newhsh = {}
@@ -92,8 +87,6 @@ module Fluent
         raise Fluent::ConfigError, "Invalid de_dot_separator: cannot be or contain '.'"
       end
 
-      @tag_to_kubernetes_name_regexp_compiled = Regexp.compile(@tag_to_kubernetes_name_regexp)
-
       # Use Kubernetes default service account if we're in a pod.
       if @kubernetes_url.nil?
         env_host = ENV['KUBERNETES_SERVICE_HOST']
@@ -130,13 +123,16 @@ module Fluent
         pod_refresh.join
       end
 
-      if @watch
-        @thread = Thread.new(&method(:watch_pods))
-        @thread.abort_on_exception = true
-      end
+#      if @watch
+#        @thread = Thread.new(&method(:watch_pods))
+#        @thread.abort_on_exception = true
+#      end
 
-      @thread_events = Thread.new(&method(:watch_events))
-      @thread_events.abort_on_exception = true
+      @thread = Thread.new(&method(:watch_resource))
+      @thread.abort_on_exception = true
+
+      @threads = []
+
     end
 
     def start_kubclient
@@ -228,10 +224,10 @@ module Fluent
       end
     end
 
-    def watch_events
+    def watch_resource
       begin
         resource_version = @client.get_pods.resourceVersion
-        watcher          = @client.watch_events(resource_version)
+        watcher          = @client.watch_entities(@resource, options = {resource_version: resource_version})
       rescue Exception => e
         raise Fluent::ConfigError, "Exception encountered fetching metadata from Kubernetes API endpoint: #{e.message}"
       end
@@ -246,7 +242,21 @@ module Fluent
     def emit_event(event_obj, time, type)
       payload = syms_to_strs(event_obj)
       payload['event_type'] = type
-      tag = "kubernetes.event.#{event_obj['metadata']['namespace']}.#{event_obj['metadata']['name']}"
+      res_name = @resource.to_s.downcase
+      namespace_name = event_obj['metadata']['namespace'] ? event_obj['metadata']['namespace'] : "openshift-infra"
+      if event_obj['metadata']['labels'] then
+        labels = []
+        syms_to_strs(event_obj['metadata']['labels'].to_h).each{|k,v| labels << "#{k}=#{v}"}
+        payload['metadata']['labels'] = labels
+      end
+#      payload['annotations'] = syms_to_strs(notice_obj['metadata']['annotations'].to_h).map{|k,v| "#{k}=#{v}"}.join(',') if notice_obj['metadata']['annotations']
+      if event_obj['metadata']['annotations'] then
+        annotations = []
+        syms_to_strs(event_obj['metadata']['annotations'].to_h).each{|k,v| annotations << "#{k}=#{v}"}
+        payload['metadata']['annotations'] = annotations
+      end
+
+      tag = "kubernetes.#{res_name}.#{namespace_name}.#{event_obj['metadata']['name']}"
 
       router.emit(tag, time, payload)
     end
@@ -266,8 +276,8 @@ module Fluent
         'status' => notice_obj['status']['phase'],
         'containers' => notice_obj['status']['containerStatuses']
       }
-      payload['labels'] = syms_to_strs(notice_obj['metadata']['labels'].to_h).map{|k,v| "#{k}=#{v}"}.join('') if notice_obj['metadata']['labels']
-      payload['annotations'] = syms_to_strs(notice_obj['metadata']['annotations'].to_h).map{|k,v| "#{k}=#{v}"}.join('') if notice_obj['metadata']['annotations']
+      payload['labels'] = syms_to_strs(notice_obj['metadata']['labels'].to_h).map{|k,v| "{#{k}=#{v}}"}.join(',') if notice_obj['metadata']['labels']
+      payload['annotations'] = syms_to_strs(notice_obj['metadata']['annotations'].to_h).map{|k,v| "#{k}=#{v}"}.join(',') if notice_obj['metadata']['annotations']
       payload['pod_ip'] = notice_obj['status']['podIP'] if notice_obj['status']['podIP']
       payload['host_ip'] = notice_obj['status']['hostIP'] if notice_obj['status']['hostIP']
       payload['hostname'] = notice_obj['status']['host'] if notice_obj['status']['host']

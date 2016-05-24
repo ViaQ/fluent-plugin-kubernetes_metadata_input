@@ -4,11 +4,11 @@ $LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
 
 Gem::Specification.new do |gem|
   gem.name          = "fluent-plugin-kubernetes_metadata_input"
-  gem.version       = "0.21.4"
-  gem.authors       = ["Jimmi Dyson"]
-  gem.email         = ["jimmidyson@gmail.com"]
-  gem.description   = %q{Filter plugin to add Kubernetes metadata}
-  gem.summary       = %q{Filter plugin to add Kubernetes metadata}
+  gem.version       = "0.21.7"
+  gem.authors       = ["Anton Sherkhonov"]
+  gem.email         = ["sherkhonov@gmail.com"]
+  gem.description   = %q{Input plugin to collect Kubernetes metadata}
+  gem.summary       = %q{Input plugin to collect Kubernetes metadata}
   gem.homepage      = "https://github.com/t0ffel/fluent-plugin-kubernetes_metadata_input"
   gem.license       = "ASL2"
 
