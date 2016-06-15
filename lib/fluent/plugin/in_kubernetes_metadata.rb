@@ -93,6 +93,9 @@ module Fluent
           @bearer_token_file = pod_token
         end
       end
+
+      @get_res_string = "get_#{@resource.downcase}"
+      log.trace "resource get method is #{@get_res_string}"
     end
 
     def start
@@ -140,17 +143,25 @@ module Fluent
     end
 
     def watch_resource
-      begin
-        resource_version = @client.get_pods.resourceVersion
-        watcher          = @client.watch_entities(@resource, options = {resource_version: resource_version})
-      rescue Exception => e
-        raise Fluent::ConfigError, "Exception encountered fetching metadata from Kubernetes API endpoint: #{e.message}"
-      end
+      loop do
+        begin
+          resource_version = @client.send(@get_res_string).resourceVersion
+          watcher          = @client.watch_entities(@resource, options = {resource_version: resource_version})
+        rescue Exception => e
+          raise Fluent::ConfigError, "Exception encountered fetching metadata from Kubernetes API endpoint: #{e.message}"
+        end
 
 
-      watcher.each do |notice|
-        time = Engine.now
-        emit_event(notice.object, time, notice.type)
+        begin
+          watcher.each do |notice|
+            time = Engine.now
+            emit_event(notice.object, time, notice.type)
+          end
+          log.trace "Exited resource watcher"
+        rescue
+          log.error "Unexpected error in resource watcher", :error=>$!.to_s
+          log.error_backtrace
+        end
       end
     end
 
